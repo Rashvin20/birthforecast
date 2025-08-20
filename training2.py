@@ -1,381 +1,413 @@
-# training.py
-# Trains 4 model families (GLM, GBDT, Hurdle, Linear), picks the best by Poisson deviance,
-# rolls forecasts month-by-month until August of the next calendar year after the last
-# observation, applies a discrete-threshold rule, and saves:
-#   - Sheet1 (original data)
-#   - Forecast (per-colony predictions for all models + chosen + discretized)
-#   - Monthly_Totals_Thresholded (sum of discretized births per month,
-#     and the continuous total from the chosen model for reference)
+# ---------------------------------------------
+# Birth Count Prediction: 3 Models + Inference
+# ---------------------------------------------
+# Models:
+#   (A) GLM (PoissonRegressor; falls back to Tweedie if needed)
+#   (B) Poisson GBDT (falls back to squared_error if Poisson loss not supported)
+#   (C) Hurdle: Logistic(any-birth) + Poisson(on positives) with SAFE fallbacks
 #
-# Input: Birth_prediction_18.08.25.xlsx (first sheet)
-# Output: birth_forecasts_to_next_Aug_with_totals.xlsx
+# Manual metrics (NumPy only): RMSE, MAE, Poisson deviance, R^2
+# Matplotlib: y vs ŷ scatter; residual hist
+# Output Excel: next_month_birth_forecasts.xlsx
+#   - Sheet "Forecasts": date, colref/col_unique_id, predicted_births
+#   - Sheet "Forecasts_all_models": ... + pred_glm, pred_gbdt, pred_hurdle
+#
+# Requirements: pandas, numpy, matplotlib, scikit-learn, xlsxwriter (or openpyxl)
+# ---------------------------------------------
 
-import warnings
-warnings.filterwarnings('ignore')
-
-from pathlib import Path
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
 from pandas.tseries.offsets import DateOffset
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import LogisticRegression
 
-# -----------------------------
-# Config
-# -----------------------------
-INPUT_PATH = "Birth_prediction_18.08.25.xlsx"
-SHEET_NAME = 0
-OUTPUT_XLSX = "birth_forecasts_to_next_Aug_with_totals.xlsx"
+# --- Poisson GLM import with fallback to Tweedie ---
+USE_TWEEDIE = False
+try:
+    from sklearn.linear_model import PoissonRegressor
+except Exception:
+    from sklearn.linear_model import TweedieRegressor
+    USE_TWEEDIE = True
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def build_ohe():
-    """Handle both new and old sklearn signatures (sparse_output vs sparse)."""
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+# --- GBDT import ---
+from sklearn.ensemble import HistGradientBoostingRegressor
 
-def clip_pos(x):
-    try:
-        return max(0.0, float(x))
-    except Exception:
-        return 0.0
-
-def poisson_mean_deviance(y_true, y_pred):
-    """Mean Poisson deviance (lower is better)."""
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.maximum(0.0, np.asarray(y_pred, dtype=float))
-    yhat = y_pred.copy()
-    yhat[yhat < 1e-12] = 1e-12
-    ratio = np.ones_like(y_true)
-    mask = y_true > 0
-    ratio[mask] = y_true[mask] / yhat[mask]
-    term = np.zeros_like(y_true)
-    term[mask] = y_true[mask] * np.log(ratio[mask])
-    dev = 2.0 * (term - (y_true - yhat))
-    return float(np.mean(dev))
-
-def threshold_map(x: float) -> int:
-    """Your discretization rule on the chosen model's prediction."""
-    if x < 0.2:
-        return 0
-    elif x < 1.2:
-        return 1
-    elif x < 2.3:
-        return 2
-    else:
-        return 3
-
-# -----------------------------
-# Load data & basic features
-# -----------------------------
-df = pd.read_excel(INPUT_PATH, sheet_name=SHEET_NAME).copy()
+# =========
+# 0) LOAD
+# =========
+INPUT_PATH = "Birth_prediction_18.08.25.xlsx"  # adjust if needed
+df = pd.read_excel(INPUT_PATH, sheet_name="Sheet1").copy()
 df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
 
 for dcol in ["datcre", "latest_date_of_male_intro"]:
     if dcol in df.columns:
         df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
 
-if "datcre" not in df.columns:
-    raise ValueError("Expected 'datcre' column in input")
-if "num_births_this_mth" not in df.columns:
-    raise ValueError("Expected 'num_births_this_mth' in input")
+if "datcre" in df.columns:
+    df["month"] = df["datcre"].dt.month
+    df["year"]  = df["datcre"].dt.year
 
-df["month"] = df["datcre"].dt.month
-df["year"]  = df["datcre"].dt.year
-if "latest_date_of_male_intro" in df.columns:
+if "latest_date_of_male_intro" in df.columns and "datcre" in df.columns:
     df["days_since_male_intro"] = (df["datcre"] - df["latest_date_of_male_intro"]).dt.days
+
+if "num_births_this_mth" not in df.columns:
+    raise ValueError("Expected column 'num_births_this_mth' not found.")
 df["any_birth"] = (df["num_births_this_mth"] > 0).astype(int)
 
+# Chronological order (avoid leakage)
 sort_cols = ["datcre"] + (["colref"] if "colref" in df.columns else [])
 df = df.sort_values(sort_cols).reset_index(drop=True)
 
-# -----------------------------
-# Feature lists
-# -----------------------------
-num_cols_canonical = [
+# ==========
+# 1) FEATS
+# ==========
+ignore_cols = {"colid", "datcre", "current_cage", "latest_date_of_male_intro"}
+candidate_num = [
+    "mths_since_col_creation","current_no_f","no_f_with_bab",
+    "min_age","max_age","avg_age",
+    "no_f_prev_mth1","avg_age_prev1","no_f_prev_mth2","avg_age_prev2",
+    "change_in_num_f_during_mth",
     "num_births_prev_mth","num_births_prev_2_mth","num_births_prev_3_mth",
     "num_births_prev_4_mth","num_births_prev_5_mth","num_births_prev_6_mth",
-    "current_no_f","avg_age","min_age","max_age",
-    "mths_since_col_creation","month","year","days_since_male_intro",
-    "change_in_num_f_during_mth"
+    "days_since_male_intro","month","year","is_new_colony"
 ]
-num_cols = [c for c in num_cols_canonical if c in df.columns]
-cat_cols = [c for c in ["site","colony_type"] if c in df.columns]
-if len(num_cols) + len(cat_cols) == 0:
-    fallback = [
-        "num_births_prev_mth","num_births_prev_2_mth","num_births_prev_3_mth",
-        "current_no_f","avg_age","mths_since_col_creation","month","year","days_since_male_intro"
-    ]
-    num_cols = [c for c in fallback if c in df.columns]
-    cat_cols = [c for c in ["site","colony_type"] if c in df.columns]
-feat_cols = num_cols + cat_cols
-assert len(feat_cols) > 0, "No usable features found"
+num_cols = [c for c in candidate_num if c in df.columns and c not in ignore_cols]
+cat_cols = [c for c in ["site","colony_type"] if c in df.columns and c not in ignore_cols]
 
-# -----------------------------
-# Train / test split (time-ordered)
-# -----------------------------
+# ============================
+# 2) TRAIN / TEST (time split)
+# ============================
 model_df = df.dropna(subset=["num_births_this_mth"]).copy()
 split_idx = int(0.8 * len(model_df))
 train_df = model_df.iloc[:split_idx].copy()
 test_df  = model_df.iloc[split_idx:].copy()
 
-X_train = train_df[feat_cols].copy()
+X_train = train_df[num_cols + cat_cols].copy()
 y_train = train_df["num_births_this_mth"].astype(float).values
-X_test  = test_df[feat_cols].copy()
+X_test  = test_df[num_cols + cat_cols].copy()
 y_test  = test_df["num_births_this_mth"].astype(float).values
 
-# -----------------------------
-# Preprocessor
-# -----------------------------
-pre_cat = Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", build_ohe())])
+# ========================
+# 3) PREPROCESSOR (Impute+OHE)
+# ========================
+
+pre_cat = Pipeline([("impute", SimpleImputer(strategy="most_frequent")),
+                    ("ohe", OneHotEncoder(handle_unknown="ignore"))])
 pre_num = Pipeline([("impute", SimpleImputer(strategy="median"))])
-preprocess = ColumnTransformer([("cat", pre_cat, cat_cols), ("num", pre_num, num_cols)])
+preprocess = ColumnTransformer([
+    ("cat", pre_cat, cat_cols),
+    ("num", pre_num, num_cols),
+])
 
-# -----------------------------
-# Models
-# -----------------------------
-# (A) GLM Poisson or Tweedie (power=1)
-USE_TWEEDIE = False
-try:
-    from sklearn.linear_model import PoissonRegressor
-    glm_model = Pipeline([("prep", preprocess), ("model", PoissonRegressor(alpha=0.01, max_iter=1000))])
-except Exception:
+
+# =======================
+# 4) MANUAL METRICS
+# =======================
+
+def _safe_pos(a, eps=1e-12):
+    a = np.asarray(a, dtype=float)
+    a[a < eps] = eps
+    return a
+
+def manual_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_pred = np.where(y_pred < 0.0, 0.0, y_pred)
+
+    mse = float(np.mean((y_true - y_pred)**2.0))
+    rmse = float(np.sqrt(mse))
+    mae  = float(np.mean(np.abs(y_true - y_pred)))
+
+    yhat = _safe_pos(y_pred)
+    ratio = np.ones_like(y_true)
+    mask = y_true > 0
+    ratio[mask] = y_true[mask] / yhat[mask]
+    term = np.zeros_like(y_true)
+    term[mask] = y_true[mask] * np.log(ratio[mask])
+    dev  = 2.0 * (term - (y_true - yhat))
+    mpd  = float(np.mean(dev))
+
+    ybar = float(np.mean(y_true))
+    sst  = float(np.sum((y_true - ybar)**2.0))
+    sse  = float(np.sum((y_true - y_pred)**2.0))
+    r2   = float(1.0 - sse/sst) if sst > 0 else float("nan")
+    return rmse, mae, mpd, r2
+
+# =======================
+# 5) BASELINES (manual)
+# =======================
+if "num_births_prev_mth" in X_test.columns:
+    naive_last = X_test["num_births_prev_mth"].fillna(0).values
+else:
+    naive_last = np.full_like(y_test, fill_value=np.mean(y_train), dtype=float)
+
+prev_cols = [c for c in ["num_births_prev_mth","num_births_prev_2_mth","num_births_prev_3_mth"] if c in X_test.columns]
+if prev_cols:
+    naive_3m = X_test[prev_cols].astype(float).mean(axis=1).fillna(0).values
+else:
+    naive_3m = np.full_like(y_test, fill_value=np.mean(y_train), dtype=float)
+
+print("\n=== Time-ordered Test Metrics ===")
+rmse, mae, mpd, r2 = manual_metrics(y_test, naive_last)
+print("\nNaive_last:")
+print(f"  RMSE: {rmse:.4f}\n  MAE: {mae:.4f}\n  PoissonDev: {mpd:.4f}\n  R2: {r2:.4f}")
+
+rmse, mae, mpd, r2 = manual_metrics(y_test, naive_3m)
+print("\nNaive_3m:")
+print(f"  RMSE: {rmse:.4f}\n  MAE: {mae:.4f}\n  PoissonDev: {mpd:.4f}\n  R2: {r2:.4f}")
+
+# =======================
+# 6A) (A) GLM: Poisson/Tweedie
+# =======================
+if USE_TWEEDIE:
     from sklearn.linear_model import TweedieRegressor
-    glm_model = Pipeline([("prep", preprocess), ("model", TweedieRegressor(power=1, alpha=0.01, max_iter=1000))])
-    USE_TWEEDIE = True
+    glm_model = Pipeline([("prep", preprocess),
+                          ("model", TweedieRegressor(power=1, alpha=1.0, max_iter=2000))])
+else:
+    glm_model = Pipeline([("prep", preprocess),
+                          ("model", PoissonRegressor(alpha=1.0, max_iter=2000))])
+
 glm_model.fit(X_train, y_train)
+pred_glm = glm_model.predict(X_test)
+pred_glm = np.where(pred_glm < 0.0, 0.0, pred_glm)
+rmse_glm, mae_glm, mpd_glm, r2_glm = manual_metrics(y_test, pred_glm)
+print("\n(A) GLM (Poisson/Tweedie):")
+print(f"  RMSE: {rmse_glm:.4f}\n  MAE: {mae_glm:.4f}\n  PoissonDev: {mpd_glm:.4f}\n  R2: {r2_glm:.4f}")
 
-# (B) GBDT (Poisson if available, else squared_error)
-from sklearn.ensemble import HistGradientBoostingRegressor
+# =======================
+# 6B) (B) GBDT: Poisson (fallback)
+# =======================
+USE_SQUARED = False
 try:
-    gbdt_model = Pipeline([
-        ("prep", preprocess),
-        ("model", HistGradientBoostingRegressor(loss="poisson", max_iter=120, learning_rate=0.12, random_state=42))
-    ])
+    gbdt_model = Pipeline([("prep", preprocess),
+                           ("model", HistGradientBoostingRegressor(loss="poisson",
+                                                                   max_iter=250,
+                                                                   learning_rate=0.12,
+                                                                   random_state=42))])
     gbdt_model.fit(X_train, y_train)
+    pred_gbdt = gbdt_model.predict(X_test)
 except Exception:
-    gbdt_model = Pipeline([
-        ("prep", preprocess),
-        ("model", HistGradientBoostingRegressor(loss="squared_error", max_iter=150, learning_rate=0.10, random_state=42))
-    ])
+    USE_SQUARED = True
+    gbdt_model = Pipeline([("prep", preprocess),
+                           ("model", HistGradientBoostingRegressor(loss="squared_error",
+                                                                   max_iter=300,
+                                                                   learning_rate=0.10,
+                                                                   random_state=42))])
     gbdt_model.fit(X_train, y_train)
+    pred_gbdt = gbdt_model.predict(X_test)
 
-# (C) Hurdle (Logit + Poisson/Tweedie on positives)
+pred_gbdt = np.where(pred_gbdt < 0.0, 0.0, pred_gbdt)
+rmse_gbdt, mae_gbdt, mpd_gbdt, r2_gbdt = manual_metrics(y_test, pred_gbdt)
+print("\n(B) GBDT:", "Poisson" if not USE_SQUARED else "SquaredError (fallback)")
+print(f"  RMSE: {rmse_gbdt:.4f}\n  MAE: {mae_gbdt:.4f}\n  PoissonDev: {mpd_gbdt:.4f}\n  R2: {r2_gbdt:.4f}")
+
+# =======================
+# 6C) (C) Hurdle: SAFE logistic + Poisson
+# =======================
 y_train_bin = (y_train > 0).astype(int)
-n_pos, n_neg = int(y_train_bin.sum()), int(len(y_train_bin) - y_train_bin.sum())
-single_class = (n_pos == 0) or (n_neg == 0)
+n_pos = int(y_train_bin.sum())
+n_neg = int(len(y_train_bin) - n_pos)
 
+# Stage 1: P(any birth)
+single_class = (n_pos == 0) or (n_neg == 0)
 if single_class:
+    # degenerate case: set constant probability
     p_const = float(n_pos / len(y_train))
+    proba_any_test = np.full(len(X_test), p_const, dtype=float)
     logit_model = None
 else:
-    logit_model = Pipeline([
-        ("prep", preprocess),
-        ("model", LogisticRegression(max_iter=400, class_weight="balanced", solver="lbfgs"))
-    ])
+    logit_model = Pipeline([("prep", preprocess),
+                            ("model", LogisticRegression(max_iter=2000,
+                                                         class_weight="balanced",
+                                                         solver="lbfgs"))])
     logit_model.fit(X_train, y_train_bin)
+    proba_any_test = logit_model.predict_proba(X_test)[:, 1]
 
+# Stage 2: Poisson on positives
 pos_train = train_df[train_df["num_births_this_mth"] > 0]
 if len(pos_train) == 0:
+    # no positives at all -> predicted positive count = 0
+    mu_pos_test = np.zeros(len(X_test), dtype=float)
     pos_model = None
 else:
-    X_train_pos = pos_train[feat_cols].copy()
+    X_train_pos = pos_train[num_cols + cat_cols].copy()
     y_train_pos = pos_train["num_births_this_mth"].astype(float).values
     if USE_TWEEDIE:
         from sklearn.linear_model import TweedieRegressor
-        pos_model = Pipeline([("prep", preprocess), ("model", TweedieRegressor(power=1, alpha=0.01, max_iter=1000))])
+        pos_model = Pipeline([("prep", preprocess),
+                              ("model", TweedieRegressor(power=1, alpha=1.0, max_iter=2000))])
     else:
-        from sklearn.linear_model import PoissonRegressor
-        pos_model = Pipeline([("prep", preprocess), ("model", PoissonRegressor(alpha=0.01, max_iter=1000))])
+        pos_model = Pipeline([("prep", preprocess),
+                              ("model", PoissonRegressor(alpha=1.0, max_iter=2000))])
     pos_model.fit(X_train_pos, y_train_pos)
+    mu_pos_test = pos_model.predict(X_test)
 
-# (D) Linear Regression
-lin_model = Pipeline([("prep", preprocess), ("model", LinearRegression())])
-lin_model.fit(X_train, y_train)
+mu_pos_test = np.where(mu_pos_test < 0.0, 0.0, mu_pos_test)
+pred_hurdle = proba_any_test * mu_pos_test
+pred_hurdle = np.where(pred_hurdle < 0.0, 0.0, pred_hurdle)
 
-# -----------------------------
-# Model comparison (test Poisson deviance)
-# -----------------------------
-pred_glm_test = np.maximum(0.0, glm_model.predict(X_test))
-pred_gbdt_test = np.maximum(0.0, gbdt_model.predict(X_test))
-if logit_model is None:
-    proba_any_test = np.full(len(X_test), float(0.0 if "p_const" not in locals() else p_const), dtype=float)
-else:
-    proba_any_test = logit_model.predict_proba(X_test)[:, 1]
-mu_pos_test = np.zeros(len(X_test), dtype=float) if pos_model is None else pos_model.predict(X_test)
-pred_hurdle_test = np.maximum(0.0, proba_any_test * mu_pos_test)
-pred_lin_test = np.maximum(0.0, lin_model.predict(X_test))
+rmse_h, mae_h, mpd_h, r2_h = manual_metrics(y_test, pred_hurdle)
+print("\n(C) Hurdle (Logit + Poisson/Tweedie):")
+print(f"  RMSE: {rmse_h:.4f}\n  MAE: {mae_h:.4f}\n  PoissonDev: {mpd_h:.4f}\n  R2: {r2_h:.4f}")
+if single_class:
+    print("  [Note] Logistic stage had one class in training; used constant probability fallback.")
 
-mpd_glm = poisson_mean_deviance(y_test, pred_glm_test)
-mpd_gbdt = poisson_mean_deviance(y_test, pred_gbdt_test)
-mpd_h   = poisson_mean_deviance(y_test, pred_hurdle_test)
-mpd_lin = poisson_mean_deviance(y_test, pred_lin_test)
+# =======================
+# 7) Matplotlib plots
+# =======================
+def plot_scatter(y_true, y_pred, title):
+    plt.figure()
+    plt.scatter(y_true, y_pred, s=12)
+    lim = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    plt.plot(lim, lim)
+    plt.xlabel("Actual")
+    plt.ylabel("Predicted")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
 
-poisson_devs = {"glm": mpd_glm, "gbdt": mpd_gbdt, "hurdle": mpd_h, "linear": mpd_lin}
-best_key = min(poisson_devs, key=poisson_devs.get)
+def plot_residuals(y_true, y_pred, title):
+    plt.figure()
+    resid = y_true - y_pred
+    plt.hist(resid, bins=30)
+    plt.xlabel("Residual (y - ŷ)")
+    plt.ylabel("Frequency")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
 
-print("\n=== Time-ordered Test Mean Poisson Deviance (lower=better) ===")
-for k, v in poisson_devs.items():
-    print(f"{k:>7}: {v:.6f}")
-print(f"Best family: {best_key}")
+plot_scatter(y_test, pred_glm,    "GLM: Actual vs Predicted")
+plot_scatter(y_test, pred_gbdt,   "GBDT: Actual vs Predicted")
+plot_scatter(y_test, pred_hurdle, "Hurdle: Actual vs Predicted")
 
-# -----------------------------
-# Inference roll to next August
-# -----------------------------
-# Build month list: from month after last observation → August next year
+plot_residuals(y_test, pred_glm,    "GLM Residuals")
+plot_residuals(y_test, pred_gbdt,   "GBDT Residuals")
+plot_residuals(y_test, pred_hurdle, "Hurdle Residuals")
 
-last_obs = pd.to_datetime(df["datcre"]).max()
-start_month = (last_obs + DateOffset(months=1)).replace(day=1)
-end_month   = pd.Timestamp(year=last_obs.year + 1, month=8, day=1)
-months = pd.period_range(start=start_month.to_period("M"),
-                         end=end_month.to_period("M"),
-                         freq="M")
-
-# Last observed row per colony -> starting state
-if "colref" in df.columns:
-    last = df.sort_values("datcre").groupby("colref", as_index=False).tail(1).copy()
+# =======================
+# 8) Inference (next month, per colony)
+# =======================
+df_latest = df.copy()
+if "colref" in df_latest.columns:
+    last_rows = df_latest.sort_values("datcre").groupby("colref", as_index=False).tail(1).copy()
     id_col = "colref"
 else:
-    group_cols = [c for c in ["site","colony_type"] if c in df.columns]
-    last = df.sort_values("datcre").groupby(group_cols, as_index=False).tail(1).copy()
-    id_col = "col_unique_id"
-    last[id_col] = np.arange(len(last), dtype=int)
+    grp_cols = [c for c in ["site","colony_type"] if c in df_latest.columns]
+    last_rows = df_latest.sort_values("datcre").groupby(grp_cols, as_index=False).tail(1).copy()
+    id_col = None
+    last_rows["col_unique_id"] = np.arange(len(last_rows))
 
-def shift_lags_inplace(state_dict, y_pred):
-    """Shift lag features and insert y_pred as prev_1 if present."""
-    keys = [
-        "num_births_prev_mth",
-        "num_births_prev_2_mth",
-        "num_births_prev_3_mth",
-        "num_births_prev_4_mth",
-        "num_births_prev_5_mth",
-        "num_births_prev_6_mth",
-    ]
-    if keys[-1] in state_dict: state_dict[keys[-1]] = state_dict.get(keys[-2], np.nan)
-    if keys[-2] in state_dict: state_dict[keys[-2]] = state_dict.get(keys[-3], np.nan)
-    if keys[-3] in state_dict: state_dict[keys[-3]] = state_dict.get(keys[-4], np.nan)
-    if keys[-4] in state_dict: state_dict[keys[-4]] = state_dict.get(keys[-5], np.nan)
-    if keys[-5] in state_dict: state_dict[keys[-5]] = state_dict.get(keys[-6], np.nan if len(keys) >= 6 else np.nan)
-    if keys[0] in state_dict:  state_dict[keys[0]] = float(y_pred)
+# Advance one month
+last_rows["date"] = last_rows["datcre"] + DateOffset(months=1)
 
-def ensure_scoring_row(state_dict, date_for_month):
-    """Build single-row DataFrame with expected features for a calendar month."""
-    row = {c: state_dict.get(c, np.nan) for c in feat_cols}
-    row["month"] = date_for_month.month
-    row["year"]  = date_for_month.year
-    lmi = state_dict.get("latest_date_of_male_intro", np.nan)
-    row["days_since_male_intro"] = np.nan if pd.isna(lmi) else (date_for_month - pd.to_datetime(lmi)).days
-    s = pd.DataFrame([row])
-    for c in cat_cols:
-        if c in s.columns:
-            s[c] = s[c].astype("object")
-    for c in feat_cols:
-        if c not in s.columns:
-            s[c] = np.nan
-    return s[feat_cols]
+# Shift lag features to next month
+def shift_lags_row(row):
+    return pd.Series({
+        "num_births_prev_mth":   row.get("num_births_this_mth", np.nan),
+        "num_births_prev_2_mth": row.get("num_births_prev_mth", np.nan),
+        "num_births_prev_3_mth": row.get("num_births_prev_2_mth", np.nan),
+        "num_births_prev_4_mth": row.get("num_births_prev_3_mth", np.nan),
+        "num_births_prev_5_mth": row.get("num_births_prev_4_mth", np.nan),
+        "num_births_prev_6_mth": row.get("num_births_prev_5_mth", np.nan),
+    })
 
-def predict_one(key: str, s: pd.DataFrame) -> float:
-    """Predict a single value with the given family key."""
-    if key == "glm":
-        return clip_pos(glm_model.predict(s)[0])
-    elif key == "gbdt":
-        return clip_pos(gbdt_model.predict(s)[0])
-    elif key == "hurdle":
-        if logit_model is None:
-            p = float(0.0 if "p_const" not in globals() else p_const)
-        else:
-            p = float(logit_model.predict_proba(s)[0, 1])
-        if (pos_model is None):
-            mu = 0.0
-        else:
-            mu = clip_pos(pos_model.predict(s)[0])
-        return clip_pos(p * mu)
-    elif key == "linear":
-        return clip_pos(lin_model.predict(s)[0])
-    else:
-        raise ValueError(f"Unknown family key: {key}")
+lag_updates = last_rows.apply(shift_lags_row, axis=1)
+for c in lag_updates.columns:
+    last_rows[c] = lag_updates[c]
 
-forecast_rows = []
+# Age/timing updates
+if "mths_since_col_creation" in last_rows.columns:
+    last_rows["mths_since_col_creation"] = last_rows["mths_since_col_creation"].fillna(0) + 1
+for a in ["avg_age","min_age","max_age"]:
+    if a in last_rows.columns:
+        last_rows[a] = pd.to_numeric(last_rows[a], errors="coerce") + 1.0
+last_rows["month"] = last_rows["date"].dt.month
+last_rows["year"]  = last_rows["date"].dt.year
+if "latest_date_of_male_intro" in last_rows.columns:
+    last_rows["days_since_male_intro"] = (last_rows["date"] - last_rows["latest_date_of_male_intro"]).dt.days
 
-for _, last_row in last.iterrows():
-    state = last_row.to_dict()
-    current_date = pd.to_datetime(state["datcre"])
+# Build scoring frame
+score_cols = num_cols + cat_cols
+for mc in score_cols:
+    if mc not in last_rows.columns:
+        last_rows[mc] = 0 if mc in num_cols else ""
+X_next = last_rows[score_cols].copy()
 
-    for m in months:
-        # Step forward month-by-month using ONLY the chosen model to advance lags
-        while current_date.to_period("M") < m:
-            next_date = current_date + DateOffset(months=1)
+# Predict with the three models
+next_glm    = glm_model.predict(X_next)
+next_glm    = np.where(next_glm < 0.0, 0.0, next_glm)
 
-            # Update maturity/ages
-            if "mths_since_col_creation" in state:
-                try:
-                    state["mths_since_col_creation"] = float(state.get("mths_since_col_creation", 0)) + 1.0
-                except Exception:
-                    state["mths_since_col_creation"] = 1.0
-            for a in ["avg_age","min_age","max_age"]:
-                if a in state:
-                    try:
-                        state[a] = float(pd.to_numeric(state.get(a), errors="coerce")) + 1.0
-                    except Exception:
-                        state[a] = np.nan
+try:
+    next_gbdt = gbdt_model.predict(X_next)
+except Exception:
+    next_gbdt = np.zeros(len(X_next), dtype=float)
+next_gbdt   = np.where(next_gbdt < 0.0, 0.0, next_gbdt)
 
-            s_step = ensure_scoring_row(state, next_date)
-            y_step = predict_one(best_key, s_step)   # only chosen model here
-            shift_lags_inplace(state, y_step)
+if logit_model is None:
+    # same p_const used at test time
+    p_const = float(n_pos / len(y_train))
+    next_proba = np.full(len(X_next), p_const, dtype=float)
+else:
+    next_proba = logit_model.predict_proba(X_next)[:, 1]
 
-            current_date = next_date
-            state["datcre"] = current_date
-            state["month"]  = current_date.month
-            state["year"]   = current_date.year
+if pos_model is None:
+    next_mu_pos = np.zeros(len(X_next), dtype=float)
+else:
+    next_mu_pos = pos_model.predict(X_next)
+next_mu_pos = np.where(next_mu_pos < 0.0, 0.0, next_mu_pos)
+next_hurdle = np.where(next_proba * next_mu_pos < 0.0, 0.0, next_proba * next_mu_pos)
 
-        # At month m, compute ALL model predictions for saving
-        s_final = ensure_scoring_row(state, current_date)
-        y_glm  = predict_one("glm", s_final)
-        y_gbdt = predict_one("gbdt", s_final)
-        y_hurdle = predict_one("hurdle", s_final)
-        y_lin  = predict_one("linear", s_final)
-        y_chosen = {"glm": y_glm, "gbdt": y_gbdt, "hurdle": y_hurdle, "linear": y_lin}[best_key]
+# Choose best model by lowest Poisson deviance on TEST set
+poisson_devs = {
+    "glm": mpd_glm,
+    "gbdt": mpd_gbdt,
+    "hurdle": mpd_h
+}
+best_key = min(poisson_devs, key=poisson_devs.get)
+if best_key == "glm":
+    chosen = next_glm
+elif best_key == "gbdt":
+    chosen = next_gbdt
+else:
+    chosen = next_hurdle
 
-        out = {
-            "date": pd.Timestamp(current_date.date()),
-            id_col: state.get(id_col, ""),
-            "site": state.get("site", ""),
-            "pred_glm": y_glm,
-            "pred_gbdt": y_gbdt,
-            "pred_hurdle": y_hurdle,
-            "pred_linear": y_lin,
-            "predicted_births": y_chosen,
-            "model_used": best_key
-        }
-        # Apply thresholding rule (discretized count)
-        out["births_discrete"] = int(threshold_map(y_chosen))
+# ===========
+# 9) EXPORT
+# ===========
+OUT_PATH = Path("next_month_birth_forecasts.xlsx")
+# Sheet 1: single chosen prediction
+if id_col:
+    ids = last_rows[id_col]
+    id_name = id_col
+else:
+    ids = last_rows["col_unique_id"]
+    id_name = "col_unique_id"
 
-        forecast_rows.append(out)
+export_main = pd.DataFrame({
+    "date": last_rows["date"].dt.date,
+    id_name: ids,
+    "predicted_births": chosen
+})
 
-# -----------------------------
-# Build outputs & save
-# -----------------------------
+# Sheet 2: all three model predictions (for transparency)
+export_all = pd.DataFrame({
+    "date": last_rows["date"].dt.date,
+    id_name: ids,
+    "pred_glm": next_glm,
+    "pred_gbdt": next_gbdt,
+    "pred_hurdle": next_hurdle
+})
 
-forecast_df = pd.DataFrame(forecast_rows).sort_values(["date", id_col]).reset_index(drop=True)
+with pd.ExcelWriter(OUT_PATH, engine="xlsxwriter") as writer:
+    export_main.to_excel(writer, index=False, sheet_name="Forecasts")
+    export_all.to_excel(writer, index=False, sheet_name="Forecasts_all_models")
 
-monthly_totals = forecast_df.groupby("date", as_index=False).agg(
-    total_births=("births_discrete", "sum"),
-    total_forecast_continuous=("predicted_births", "sum")
-)
-
-out_path = Path(OUTPUT_XLSX)
-with pd.ExcelWriter(out_path, engine="openpyxl", mode="w") as writer:
-    df.to_excel(writer, sheet_name="Sheet1", index=False)
-    forecast_df.to_excel(writer, sheet_name="Forecast", index=False)
-    monthly_totals.to_excel(writer, sheet_name="Monthly_Totals_Thresholded", index=False)
-
-print(f"\nSaved forecasts to: {out_path.resolve()}")
-print("\nMonthly totals (last 5 rows):")
-print(monthly_totals.tail(5).to_string(index=False))
+print(f"\nSaved next-month forecasts to: {OUT_PATH.resolve()}")
+print("\nPreview (Forecasts):")
+print(export_main.head(10).to_string(index=False))
