@@ -1,17 +1,14 @@
 # training.py
-# Trains 4 model families (GLM, GBDT, Hurdle, Linear), picks the best by Poisson deviance,
-# rolls forecasts month-by-month until August of the next calendar year after the last
-# observation, applies a discrete-threshold rule, and saves:
-#   - Sheet1 (original data)
-#   - Forecast (per-colony predictions for all models + chosen + discretized)
-#   - Monthly_Totals_Thresholded (sum of discretized births per month,
-#     and the continuous total from the chosen model for reference)
-#
-# Input: Birth_prediction_18.08.25.xlsx (first sheet)
-# Output: birth_forecasts_to_next_Aug_with_totals.xlsx
+# Linear-only forecasting with robust cleaning, standardized numerics, OHE categoricals.
+# Model = Ridge (linear); alpha chosen by minimizing Poisson deviance via time-aware CV.
+# Outputs:
+#   - Sheet1 (cleaned input)
+#   - Forecast (per-colony predictions + discretized)
+#   - Monthly_Totals (continuous total + floored integer)
+# Prints test MSE + test Poisson deviance.
 
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 from pathlib import Path
 import numpy as np
@@ -19,17 +16,20 @@ import pandas as pd
 from pandas.tseries.offsets import DateOffset
 
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
 
 # -----------------------------
 # Config
 # -----------------------------
-INPUT_PATH = "Birth_prediction_18.08.25.xlsx"
-SHEET_NAME = 0
-OUTPUT_XLSX = "birth_forecasts_to_next_Aug_with_totals.xlsx"
+INPUT_PATH  = "Birth_prediction_18.08.25.xlsx"
+SHEET_NAME  = 0
+OUTPUT_XLSX = "birth_forecasts_to_next_Aug2026.xlsx"
+RANDOM_SEED = 42
+EPS = 1e-12  # for Poisson deviance stability
 
 # -----------------------------
 # Helpers
@@ -49,20 +49,18 @@ def clip_pos(x):
 
 def poisson_mean_deviance(y_true, y_pred):
     """Mean Poisson deviance (lower is better)."""
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.maximum(0.0, np.asarray(y_pred, dtype=float))
-    yhat = y_pred.copy()
-    yhat[yhat < 1e-12] = 1e-12
-    ratio = np.ones_like(y_true)
-    mask = y_true > 0
-    ratio[mask] = y_true[mask] / yhat[mask]
-    term = np.zeros_like(y_true)
-    term[mask] = y_true[mask] * np.log(ratio[mask])
-    dev = 2.0 * (term - (y_true - yhat))
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    yp = np.maximum(yp, EPS)  # avoid log(0); also make non-negative
+    # term y*log(y/mu) with convention 0*log(0/mu)=0
+    term = np.zeros_like(yt)
+    mask = yt > 0
+    term[mask] = yt[mask] * np.log(yt[mask] / yp[mask])
+    dev = 2.0 * (term - (yt - yp))
     return float(np.mean(dev))
 
 def threshold_map(x: float) -> int:
-    """Your discretization rule on the chosen model's prediction."""
+    """Discretize per your rule."""
     if x < 0.2:
         return 0
     elif x < 1.2:
@@ -72,29 +70,99 @@ def threshold_map(x: float) -> int:
     else:
         return 3
 
+def month_sin_cos(df):
+    """Add simple seasonality features from month; safe, no leakage."""
+    m = (df["datcre"].dt.month if "datcre" in df.columns else df["month"]).astype(float)
+    df["month_sin"] = np.sin(2*np.pi*(m/12.0))
+    df["month_cos"] = np.cos(2*np.pi*(m/12.0))
+    return df
+
+def make_expanding_time_splits(n, n_splits=5, min_train_frac=0.5):
+    """
+    Expanding-window CV for time series:
+    yields (train_idx, val_idx) with growing train windows and contiguous val blocks.
+    """
+    n = int(n)
+    n_splits = max(2, min(n_splits, max(2, n//5)))
+    min_train = max(1, int(n * min_train_frac))
+    if min_train >= n:
+        yield np.arange(0, n-1), np.arange(n-1, n)
+        return
+    fold_edges = np.linspace(min_train, n-1, num=n_splits, dtype=int)
+    for i, end in enumerate(fold_edges):
+        next_end = fold_edges[i+1] if (i+1) < len(fold_edges) else n-1
+        if end >= next_end:
+            continue
+        train_idx = np.arange(0, end)
+        val_idx   = np.arange(end, next_end)
+        if len(val_idx) > 0:
+            yield train_idx, val_idx
+
+def safe_to_numeric(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
 # -----------------------------
-# Load data & basic features
+# Load & CLEAN data
 # -----------------------------
-df = pd.read_excel(INPUT_PATH, sheet_name=SHEET_NAME).copy()
+df = pd.read_excel(INPUT_PATH, sheet_name=SHEET_NAME)
+
+# Standardize column names
 df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
 
+# Trim strings
+for c in df.select_dtypes(include=["object"]).columns:
+    df[c] = df[c].astype(str).str.strip().replace({"": np.nan, "nan": np.nan})
+
+# Dates
 for dcol in ["datcre", "latest_date_of_male_intro"]:
     if dcol in df.columns:
         df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
 
+# Drop rows with no date
 if "datcre" not in df.columns:
     raise ValueError("Expected 'datcre' column in input")
+df = df[~df["datcre"].isna()].copy()
+
+# Target presence check (keep rows for training if target present)
 if "num_births_this_mth" not in df.columns:
     raise ValueError("Expected 'num_births_this_mth' in input")
 
+# Coerce key numeric columns; clip negatives on counts
+numeric_maybe = [
+    "num_births_this_mth",
+    "num_births_prev_mth","num_births_prev_2_mth","num_births_prev_3_mth",
+    "num_births_prev_4_mth","num_births_prev_5_mth","num_births_prev_6_mth",
+    "current_no_f","avg_age","min_age","max_age",
+    "mths_since_col_creation","change_in_num_f_during_mth"
+]
+df = safe_to_numeric(df, numeric_maybe)
+for c in ["num_births_this_mth","num_births_prev_mth","num_births_prev_2_mth",
+          "num_births_prev_3_mth","num_births_prev_4_mth","num_births_prev_5_mth",
+          "num_births_prev_6_mth","current_no_f","mths_since_col_creation"]:
+    if c in df.columns:
+        df[c] = df[c].clip(lower=0)
+
+# Calendar/derived features
 df["month"] = df["datcre"].dt.month
 df["year"]  = df["datcre"].dt.year
 if "latest_date_of_male_intro" in df.columns:
     df["days_since_male_intro"] = (df["datcre"] - df["latest_date_of_male_intro"]).dt.days
-df["any_birth"] = (df["num_births_this_mth"] > 0).astype(int)
 
+# Optional label helper
+df["any_birth"] = np.where(df["num_births_this_mth"].notna() & (df["num_births_this_mth"] > 0), 1, 0)
+
+# Deduplicate exact duplicate rows (safe)
+df = df.drop_duplicates().copy()
+
+# Sort by time (and colony if exists)
 sort_cols = ["datcre"] + (["colref"] if "colref" in df.columns else [])
 df = df.sort_values(sort_cols).reset_index(drop=True)
+
+# Seasonality
+df = month_sin_cos(df)
 
 # -----------------------------
 # Feature lists
@@ -104,27 +172,36 @@ num_cols_canonical = [
     "num_births_prev_4_mth","num_births_prev_5_mth","num_births_prev_6_mth",
     "current_no_f","avg_age","min_age","max_age",
     "mths_since_col_creation","month","year","days_since_male_intro",
-    "change_in_num_f_during_mth"
+    "change_in_num_f_during_mth",
+    "month_sin","month_cos"
 ]
 num_cols = [c for c in num_cols_canonical if c in df.columns]
 cat_cols = [c for c in ["site","colony_type"] if c in df.columns]
+
 if len(num_cols) + len(cat_cols) == 0:
+    # Minimal fallback
     fallback = [
         "num_births_prev_mth","num_births_prev_2_mth","num_births_prev_3_mth",
-        "current_no_f","avg_age","mths_since_col_creation","month","year","days_since_male_intro"
+        "current_no_f","avg_age","mths_since_col_creation","month","year",
+        "month_sin","month_cos"
     ]
     num_cols = [c for c in fallback if c in df.columns]
-    cat_cols = [c for c in ["site","colony_type"] if c in df.columns]
+    cat_cols = []
+
 feat_cols = num_cols + cat_cols
 assert len(feat_cols) > 0, "No usable features found"
 
 # -----------------------------
-# Train / test split (time-ordered)
+# Train / Test split (time-ordered)
 # -----------------------------
 model_df = df.dropna(subset=["num_births_this_mth"]).copy()
+if len(model_df) < 10:
+    raise ValueError("Not enough labeled rows to train/test a model (need >= 10).")
+
 split_idx = int(0.8 * len(model_df))
-train_df = model_df.iloc[:split_idx].copy()
-test_df  = model_df.iloc[split_idx:].copy()
+split_idx = min(max(split_idx, 1), len(model_df)-1)
+train_df  = model_df.iloc[:split_idx].copy()
+test_df   = model_df.iloc[split_idx:].copy()
 
 X_train = train_df[feat_cols].copy()
 y_train = train_df["num_births_this_mth"].astype(float).values
@@ -132,106 +209,90 @@ X_test  = test_df[feat_cols].copy()
 y_test  = test_df["num_births_this_mth"].astype(float).values
 
 # -----------------------------
-# Preprocessor
+# Preprocessor (impute + scale numeric; impute + OHE categorical)
 # -----------------------------
-pre_cat = Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", build_ohe())])
-pre_num = Pipeline([("impute", SimpleImputer(strategy="median"))])
-preprocess = ColumnTransformer([("cat", pre_cat, cat_cols), ("num", pre_num, num_cols)])
+pre_cat = Pipeline([
+    ("impute", SimpleImputer(strategy="most_frequent")),
+    ("ohe", build_ohe())
+])
+pre_num = Pipeline([
+    ("impute", SimpleImputer(strategy="median")),
+    ("scale", StandardScaler(with_mean=True, with_std=True))
+])
+preprocess = ColumnTransformer([
+    ("cat", pre_cat, cat_cols),
+    ("num", pre_num, num_cols)
+])
 
 # -----------------------------
-# Models
+# Select alpha by minimizing Poisson deviance (time-aware CV)
 # -----------------------------
-# (A) GLM Poisson or Tweedie (power=1)
-USE_TWEEDIE = False
-try:
-    from sklearn.linear_model import PoissonRegressor
-    glm_model = Pipeline([("prep", preprocess), ("model", PoissonRegressor(alpha=0.01, max_iter=1000))])
-except Exception:
-    from sklearn.linear_model import TweedieRegressor
-    glm_model = Pipeline([("prep", preprocess), ("model", TweedieRegressor(power=1, alpha=0.01, max_iter=1000))])
-    USE_TWEEDIE = True
-glm_model.fit(X_train, y_train)
+alpha_grid = [0.0, 0.1, 0.3, 1.0, 3.0, 10.0]  # 0.0 == OLS
+cv_records = []
 
-# (B) GBDT (Poisson if available, else squared_error)
-from sklearn.ensemble import HistGradientBoostingRegressor
-try:
-    gbdt_model = Pipeline([
-        ("prep", preprocess),
-        ("model", HistGradientBoostingRegressor(loss="poisson", max_iter=120, learning_rate=0.12, random_state=42))
-    ])
-    gbdt_model.fit(X_train, y_train)
-except Exception:
-    gbdt_model = Pipeline([
-        ("prep", preprocess),
-        ("model", HistGradientBoostingRegressor(loss="squared_error", max_iter=150, learning_rate=0.10, random_state=42))
-    ])
-    gbdt_model.fit(X_train, y_train)
+def fit_and_poisson_cv(alpha):
+    fold_devs = []
+    for tr_idx, va_idx in make_expanding_time_splits(len(X_train), n_splits=5, min_train_frac=0.5):
+        X_tr, y_tr = X_train.iloc[tr_idx], y_train[tr_idx]
+        X_va, y_va = X_train.iloc[va_idx], y_train[va_idx]
 
-# (C) Hurdle (Logit + Poisson/Tweedie on positives)
-y_train_bin = (y_train > 0).astype(int)
-n_pos, n_neg = int(y_train_bin.sum()), int(len(y_train_bin) - y_train_bin.sum())
-single_class = (n_pos == 0) or (n_neg == 0)
+        pipe = Pipeline([
+            ("prep", preprocess),
+            ("model", Ridge(alpha=alpha, random_state=RANDOM_SEED))
+        ])
+        pipe.fit(X_tr, y_tr)
+        yhat_va = pipe.predict(X_va)
+        yhat_va = np.maximum(yhat_va, 0.0)  # counts
+        dev = poisson_mean_deviance(y_va, yhat_va)
+        fold_devs.append(dev)
+    return fold_devs
 
-if single_class:
-    p_const = float(n_pos / len(y_train))
-    logit_model = None
+for a in alpha_grid:
+    devs = fit_and_poisson_cv(a)
+    cv_records.append((a, float(np.mean(devs)), float(np.std(devs)), devs))
+
+best_alpha, best_mean_dev, best_std_dev, _ = sorted(cv_records, key=lambda t: (t[1], t[0]))[0]
+
+# Fit final model on full train with best alpha
+model = Pipeline([
+    ("prep", preprocess),
+    ("model", Ridge(alpha=best_alpha, random_state=RANDOM_SEED))
+])
+model.fit(X_train, y_train)
+
+# -----------------------------
+# Baseline & Test evaluation (robust to NaNs)
+# -----------------------------
+global_mean = float(np.nanmean(y_train))
+if "num_births_prev_mth" in X_test.columns:
+    prev = pd.to_numeric(X_test["num_births_prev_mth"], errors="coerce")
+    baseline_pred = prev.fillna(global_mean).to_numpy(dtype=float)
 else:
-    logit_model = Pipeline([
-        ("prep", preprocess),
-        ("model", LogisticRegression(max_iter=400, class_weight="balanced", solver="lbfgs"))
-    ])
-    logit_model.fit(X_train, y_train_bin)
+    baseline_pred = np.full_like(y_test, fill_value=global_mean, dtype=float)
 
-pos_train = train_df[train_df["num_births_this_mth"] > 0]
-if len(pos_train) == 0:
-    pos_model = None
-else:
-    X_train_pos = pos_train[feat_cols].copy()
-    y_train_pos = pos_train["num_births_this_mth"].astype(float).values
-    if USE_TWEEDIE:
-        from sklearn.linear_model import TweedieRegressor
-        pos_model = Pipeline([("prep", preprocess), ("model", TweedieRegressor(power=1, alpha=0.01, max_iter=1000))])
-    else:
-        from sklearn.linear_model import PoissonRegressor
-        pos_model = Pipeline([("prep", preprocess), ("model", PoissonRegressor(alpha=0.01, max_iter=1000))])
-    pos_model.fit(X_train_pos, y_train_pos)
+baseline_pred = np.maximum(0.0, baseline_pred)
 
-# (D) Linear Regression
-lin_model = Pipeline([("prep", preprocess), ("model", LinearRegression())])
-lin_model.fit(X_train, y_train)
+test_pred  = np.maximum(0.0, model.predict(X_test))
+train_pred = np.maximum(0.0, model.predict(X_train))
+
+baseline_mse = mean_squared_error(y_test, baseline_pred)
+test_mse     = mean_squared_error(y_test, test_pred)
+train_mse    = mean_squared_error(y_train, train_pred)
+
+# Poisson deviance (reporting metric)
+test_dev  = poisson_mean_deviance(y_test, test_pred)
+train_dev = poisson_mean_deviance(y_train, train_pred)
+
+print("\n=== Linear (Ridge/OLS), alpha selected by Poisson deviance CV ===")
+print(f"Best alpha: {best_alpha}  (CV Poisson dev mean={best_mean_dev:.6f} ± {best_std_dev:.6f})")
+print(f"Train MSE (clipped): {train_mse:.6f}   | Train Poisson dev: {train_dev:.6f}")
+print(f" Test MSE (clipped): {test_mse:.6f}   |  Test Poisson dev: {test_dev:.6f}")
+print(f"Baseline MSE (prev-month w/ NA fill): {baseline_mse:.6f}")
 
 # -----------------------------
-# Model comparison (test Poisson deviance)
+# Forecast roll to next August
 # -----------------------------
-pred_glm_test = np.maximum(0.0, glm_model.predict(X_test))
-pred_gbdt_test = np.maximum(0.0, gbdt_model.predict(X_test))
-if logit_model is None:
-    proba_any_test = np.full(len(X_test), float(0.0 if "p_const" not in locals() else p_const), dtype=float)
-else:
-    proba_any_test = logit_model.predict_proba(X_test)[:, 1]
-mu_pos_test = np.zeros(len(X_test), dtype=float) if pos_model is None else pos_model.predict(X_test)
-pred_hurdle_test = np.maximum(0.0, proba_any_test * mu_pos_test)
-pred_lin_test = np.maximum(0.0, lin_model.predict(X_test))
-
-mpd_glm = poisson_mean_deviance(y_test, pred_glm_test)
-mpd_gbdt = poisson_mean_deviance(y_test, pred_gbdt_test)
-mpd_h   = poisson_mean_deviance(y_test, pred_hurdle_test)
-mpd_lin = poisson_mean_deviance(y_test, pred_lin_test)
-
-poisson_devs = {"glm": mpd_glm, "gbdt": mpd_gbdt, "hurdle": mpd_h, "linear": mpd_lin}
-best_key = min(poisson_devs, key=poisson_devs.get)
-
-print("\n=== Time-ordered Test Mean Poisson Deviance (lower=better) ===")
-for k, v in poisson_devs.items():
-    print(f"{k:>7}: {v:.6f}")
-print(f"Best family: {best_key}")
-
-# -----------------------------
-# Inference roll to next August
-# -----------------------------
-# Build month list: from month after last observation → August next year
-
-last_obs = pd.to_datetime(df["datcre"]).max()
+last_obs    = pd.to_datetime(df["datcre"]).max()
 start_month = (last_obs + DateOffset(months=1)).replace(day=1)
 end_month   = pd.Timestamp(year=last_obs.year + 1, month=8, day=1)
 months = pd.period_range(start=start_month.to_period("M"),
@@ -270,8 +331,13 @@ def ensure_scoring_row(state_dict, date_for_month):
     row = {c: state_dict.get(c, np.nan) for c in feat_cols}
     row["month"] = date_for_month.month
     row["year"]  = date_for_month.year
+    # seasonal terms for scoring month
+    row["month_sin"] = np.sin(2*np.pi*(row["month"]/12.0)) if "month_sin" in feat_cols else np.nan
+    row["month_cos"] = np.cos(2*np.pi*(row["month"]/12.0)) if "month_cos" in feat_cols else np.nan
+    # male intro offset
     lmi = state_dict.get("latest_date_of_male_intro", np.nan)
     row["days_since_male_intro"] = np.nan if pd.isna(lmi) else (date_for_month - pd.to_datetime(lmi)).days
+
     s = pd.DataFrame([row])
     for c in cat_cols:
         if c in s.columns:
@@ -281,39 +347,21 @@ def ensure_scoring_row(state_dict, date_for_month):
             s[c] = np.nan
     return s[feat_cols]
 
-def predict_one(key: str, s: pd.DataFrame) -> float:
-    """Predict a single value with the given family key."""
-    if key == "glm":
-        return clip_pos(glm_model.predict(s)[0])
-    elif key == "gbdt":
-        return clip_pos(gbdt_model.predict(s)[0])
-    elif key == "hurdle":
-        if logit_model is None:
-            p = float(0.0 if "p_const" not in globals() else p_const)
-        else:
-            p = float(logit_model.predict_proba(s)[0, 1])
-        if (pos_model is None):
-            mu = 0.0
-        else:
-            mu = clip_pos(pos_model.predict(s)[0])
-        return clip_pos(p * mu)
-    elif key == "linear":
-        return clip_pos(lin_model.predict(s)[0])
-    else:
-        raise ValueError(f"Unknown family key: {key}")
+def predict_one(s: pd.DataFrame) -> float:
+    """Predict with linear model; clip to non-negative for counts."""
+    return clip_pos(model.predict(s)[0])
 
 forecast_rows = []
-
 for _, last_row in last.iterrows():
     state = last_row.to_dict()
     current_date = pd.to_datetime(state["datcre"])
 
     for m in months:
-        # Step forward month-by-month using ONLY the chosen model to advance lags
+        # Walk up to target month m (recursive, one month at a time)
         while current_date.to_period("M") < m:
             next_date = current_date + DateOffset(months=1)
 
-            # Update maturity/ages
+            # Update maturity/ages if present
             if "mths_since_col_creation" in state:
                 try:
                     state["mths_since_col_creation"] = float(state.get("mths_since_col_creation", 0)) + 1.0
@@ -327,7 +375,7 @@ for _, last_row in last.iterrows():
                         state[a] = np.nan
 
             s_step = ensure_scoring_row(state, next_date)
-            y_step = predict_one(best_key, s_step)   # only chosen model here
+            y_step = predict_one(s_step)
             shift_lags_inplace(state, y_step)
 
             current_date = next_date
@@ -335,46 +383,62 @@ for _, last_row in last.iterrows():
             state["month"]  = current_date.month
             state["year"]   = current_date.year
 
-        # At month m, compute ALL model predictions for saving
+        # Score month m and save
         s_final = ensure_scoring_row(state, current_date)
-        y_glm  = predict_one("glm", s_final)
-        y_gbdt = predict_one("gbdt", s_final)
-        y_hurdle = predict_one("hurdle", s_final)
-        y_lin  = predict_one("linear", s_final)
-        y_chosen = {"glm": y_glm, "gbdt": y_gbdt, "hurdle": y_hurdle, "linear": y_lin}[best_key]
+        y_hat   = predict_one(s_final)
 
         out = {
             "date": pd.Timestamp(current_date.date()),
             id_col: state.get(id_col, ""),
             "site": state.get("site", ""),
-            "pred_glm": y_glm,
-            "pred_gbdt": y_gbdt,
-            "pred_hurdle": y_hurdle,
-            "pred_linear": y_lin,
-            "predicted_births": y_chosen,
-            "model_used": best_key
+            "pred_linear": y_hat,
+            "predicted_births": y_hat,
+            "model_used": f"ridge(alpha={best_alpha})",
+            "births_discrete": int(threshold_map(y_hat)),
         }
-        # Apply thresholding rule (discretized count)
-        out["births_discrete"] = int(threshold_map(y_chosen))
-
         forecast_rows.append(out)
 
 # -----------------------------
 # Build outputs & save
 # -----------------------------
-
 forecast_df = pd.DataFrame(forecast_rows).sort_values(["date", id_col]).reset_index(drop=True)
 
 monthly_totals = forecast_df.groupby("date", as_index=False).agg(
     total_births=("births_discrete", "sum"),
     total_forecast_continuous=("predicted_births", "sum")
 )
+# Floor the continuous total to lowest integer, e.g., 45.9 -> 45
+monthly_totals["total_forecast_floor"] = np.floor(monthly_totals["total_forecast_continuous"]).astype(int)
+
+metrics_df = pd.DataFrame({
+    "metric": [
+        "best_alpha",
+        "cv_poisson_dev_mean",
+        "cv_poisson_dev_std",
+        "train_mse_clipped",
+        "test_mse_clipped",
+        "train_poisson_dev",
+        "test_poisson_dev",
+        "baseline_mse"
+    ],
+    "value": [
+        best_alpha,
+        best_mean_dev,
+        best_std_dev,
+        mean_squared_error(y_train, train_pred),
+        test_mse,
+        poisson_mean_deviance(y_train, train_pred),
+        test_dev,
+        baseline_mse
+    ]
+})
 
 out_path = Path(OUTPUT_XLSX)
 with pd.ExcelWriter(out_path, engine="openpyxl", mode="w") as writer:
     df.to_excel(writer, sheet_name="Sheet1", index=False)
     forecast_df.to_excel(writer, sheet_name="Forecast", index=False)
-    monthly_totals.to_excel(writer, sheet_name="Monthly_Totals_Thresholded", index=False)
+    monthly_totals.to_excel(writer, sheet_name="Monthly_Totals", index=False)
+    metrics_df.to_excel(writer, sheet_name="Metrics", index=False)
 
 print(f"\nSaved forecasts to: {out_path.resolve()}")
 print("\nMonthly totals (last 5 rows):")
