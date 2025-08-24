@@ -27,7 +27,7 @@ from sklearn.metrics import mean_squared_error
 # -----------------------------
 INPUT_PATH  = "Birth_prediction_18.08.25.xlsx"
 SHEET_NAME  = 0
-OUTPUT_XLSX = "birth_forecasts_to_next_Aug2026.xlsx"
+OUTPUT_XLSX = "birth_forecasts_to_next_Aug226.xlsx"
 RANDOM_SEED = 42
 EPS = 1e-12  # for Poisson deviance stability
 
@@ -208,9 +208,7 @@ y_train = train_df["num_births_this_mth"].astype(float).values
 X_test  = test_df[feat_cols].copy()
 y_test  = test_df["num_births_this_mth"].astype(float).values
 
-# -----------------------------
-# Preprocessor (impute + scale numeric; impute + OHE categorical)
-# -----------------------------
+
 pre_cat = Pipeline([
     ("impute", SimpleImputer(strategy="most_frequent")),
     ("ohe", build_ohe())
@@ -289,9 +287,7 @@ print(f"Train MSE (clipped): {train_mse:.6f}   | Train Poisson dev: {train_dev:.
 print(f" Test MSE (clipped): {test_mse:.6f}   |  Test Poisson dev: {test_dev:.6f}")
 print(f"Baseline MSE (prev-month w/ NA fill): {baseline_mse:.6f}")
 
-# -----------------------------
-# Forecast roll to next August
-# -----------------------------
+
 last_obs    = pd.to_datetime(df["datcre"]).max()
 start_month = (last_obs + DateOffset(months=1)).replace(day=1)
 end_month   = pd.Timestamp(year=last_obs.year + 1, month=8, day=1)
@@ -407,7 +403,7 @@ monthly_totals = forecast_df.groupby("date", as_index=False).agg(
     total_births=("births_discrete", "sum"),
     total_forecast_continuous=("predicted_births", "sum")
 )
-# Floor the continuous total to lowest integer, e.g., 45.9 -> 45
+
 monthly_totals["total_forecast_floor"] = np.floor(monthly_totals["total_forecast_continuous"]).astype(int)
 
 metrics_df = pd.DataFrame({
@@ -433,6 +429,113 @@ metrics_df = pd.DataFrame({
     ]
 })
 
+
+# === BEGIN: Diagnostics & Visuals (OLS vs Ridge) ===
+import matplotlib.pyplot as plt
+
+# 1) Train a "normal" least-squares model (Ridge with alpha=0 == OLS)
+ols_model = Pipeline([
+    ("prep", preprocess),
+    ("model", Ridge(alpha=0.0, random_state=RANDOM_SEED))
+])
+ols_model.fit(X_train, y_train)
+
+train_pred_ols = np.maximum(0.0, ols_model.predict(X_train))
+test_pred_ols  = np.maximum(0.0, ols_model.predict(X_test))
+
+# 2) Compute OLS metrics (so you can compare apples-to-apples)
+test_mse_ols = mean_squared_error(y_test, test_pred_ols)
+test_dev_ols = poisson_mean_deviance(y_test, test_pred_ols)
+
+print("\n=== 'Normal' OLS (alpha=0) vs Ridge ===")
+print(f"OLS   -> Test MSE: {test_mse_ols:.6f} | Test Poisson dev: {test_dev_ols:.6f}")
+print(f"Ridge -> Test MSE: {test_mse:.6f} | Test Poisson dev: {test_dev:.6f}")
+
+# Add OLS metrics to the Metrics sheet
+extra_metrics = pd.DataFrame({
+    "metric": ["test_mse_ols", "test_poisson_dev_ols"],
+    "value":  [test_mse_ols,     test_dev_ols]
+})
+metrics_df = pd.concat([metrics_df, extra_metrics], ignore_index=True)
+
+# 3) Helper for Poisson deviance residuals (to see "funnel" go away)
+def poisson_deviance_vec(y, mu, eps=EPS):
+    y = np.asarray(y, dtype=float)
+    mu = np.maximum(np.asarray(mu, dtype=float), eps)
+    term = np.zeros_like(y)
+    mask = y > 0
+    term[mask] = y[mask] * np.log(y[mask] / mu[mask])
+    return 2.0 * (term - (y - mu))
+
+def deviance_residuals(y, mu, eps=EPS):
+    d = poisson_deviance_vec(y, mu, eps)
+    s = np.sign(y - mu)
+    return s * np.sqrt(np.maximum(d, 0.0))
+
+# 4) Make and save plots
+PLOTS_DIR = Path("plots"); PLOTS_DIR.mkdir(exist_ok=True)
+
+# (a) Actual vs Pred: OLS
+plt.figure(figsize=(10,5))
+plt.plot(test_df["datcre"], y_test, marker="o", label="Actual")
+plt.plot(test_df["datcre"], test_pred_ols, marker="x", label="Predicted (OLS)")
+plt.title("Test: Actual vs Predicted (OLS)")
+plt.xlabel("Date"); plt.ylabel("Births"); plt.legend(); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"01_actual_vs_pred_OLS.png"); plt.close()
+
+# (b) Actual vs Pred: Ridge
+plt.figure(figsize=(10,5))
+plt.plot(test_df["datcre"], y_test, marker="o", label="Actual")
+plt.plot(test_df["datcre"], test_pred, marker="x", label=f"Predicted (Ridge α={best_alpha})")
+plt.title("Test: Actual vs Predicted (Ridge)")
+plt.xlabel("Date"); plt.ylabel("Births"); plt.legend(); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"02_actual_vs_pred_Ridge.png"); plt.close()
+
+# (c) Residuals vs Fitted: OLS
+plt.figure(figsize=(9,4))
+plt.axhline(0, linewidth=1)
+plt.scatter(test_pred_ols, y_test - test_pred_ols)
+plt.title("Residuals vs Fitted (OLS)")
+plt.xlabel("Fitted μ"); plt.ylabel("Residual"); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"03_residuals_vs_fitted_OLS.png"); plt.close()
+
+# (d) Residuals vs Fitted: Ridge
+plt.figure(figsize=(9,4))
+plt.axhline(0, linewidth=1)
+plt.scatter(test_pred, y_test - test_pred)
+plt.title("Residuals vs Fitted (Ridge)")
+plt.xlabel("Fitted μ"); plt.ylabel("Residual"); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"04_residuals_vs_fitted_Ridge.png"); plt.close()
+
+# (e) Deviance residuals vs fitted: OLS
+plt.figure(figsize=(9,4))
+plt.axhline(0, linewidth=1)
+plt.scatter(test_pred_ols, deviance_residuals(y_test, test_pred_ols))
+plt.title("Deviance Residuals vs Fitted (OLS)")
+plt.xlabel("Fitted μ"); plt.ylabel("Deviance residual"); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"05_dev_resid_vs_fitted_OLS.png"); plt.close()
+
+# (f) Deviance residuals vs fitted: Ridge
+plt.figure(figsize=(9,4))
+plt.axhline(0, linewidth=1)
+plt.scatter(test_pred, deviance_residuals(y_test, test_pred))
+plt.title("Deviance Residuals vs Fitted (Ridge)")
+plt.xlabel("Fitted μ"); plt.ylabel("Deviance residual"); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"06_dev_resid_vs_fitted_Ridge.png"); plt.close()
+
+# (g) CV Poisson deviance vs α (already computed in cv_records)
+alphas = [r[0] for r in cv_records]
+dev_means = [r[1] for r in cv_records]
+plt.figure(figsize=(7,4))
+plt.plot(alphas, dev_means, marker="o")
+plt.title("CV Mean Poisson Deviance vs α")
+plt.xlabel("α"); plt.ylabel("Mean Poisson deviance (lower is better)")
+plt.grid(True); plt.tight_layout()
+plt.savefig(PLOTS_DIR/"07_cv_poisson_dev_vs_alpha.png"); plt.close()
+
+print(f"Saved diagnostic plots to: {PLOTS_DIR.resolve()}")
+# === END: Diagnostics & Visuals (OLS vs Ridge) ===
+
 out_path = Path(OUTPUT_XLSX)
 with pd.ExcelWriter(out_path, engine="openpyxl", mode="w") as writer:
     df.to_excel(writer, sheet_name="Sheet1", index=False)
@@ -443,3 +546,11 @@ with pd.ExcelWriter(out_path, engine="openpyxl", mode="w") as writer:
 print(f"\nSaved forecasts to: {out_path.resolve()}")
 print("\nMonthly totals (last 5 rows):")
 print(monthly_totals.tail(5).to_string(index=False))
+
+# === Forecast totals plot ===
+plt.figure(figsize=(10,5))
+plt.plot(monthly_totals["date"], monthly_totals["total_forecast_continuous"], marker="o", label="Continuous total")
+plt.plot(monthly_totals["date"], monthly_totals["total_births"], marker="x", label="Discrete total (sum of bins)")
+plt.title("Forecasted Monthly Totals")
+plt.xlabel("Date"); plt.ylabel("Predicted births"); plt.legend(); plt.grid(True)
+plt.tight_layout(); plt.savefig(PLOTS_DIR/"08_forecast_monthly_totals.png"); plt.close()
